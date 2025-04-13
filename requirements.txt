@@ -1,3 +1,10 @@
+langchain==0.1.14
+langchain-google-genai==0.0.5
+langchain_community==0.0.26
+pypdf==3.17.4
+chromadb==0.4.22
+sentence-transformers==2.2.2
+
 # Install required packages
 !pip install langchain langchain-google-genai langchain_community pypdf chromadb sentence-transformers -q
 !pip install google-generativeai pdfplumber -q
