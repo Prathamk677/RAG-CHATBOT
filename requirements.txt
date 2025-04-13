@@ -1,0 +1,241 @@
+# Install required packages
+!pip install langchain langchain-google-genai langchain_community pypdf chromadb sentence-transformers -q
+!pip install google-generativeai pdfplumber -q
+
+!pip install streamlit
+
+!pip install pyngrok
+
+import os
+import pdfplumber
+import google.generativeai as genai
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+
+from google.colab import userdata
+os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY")
+
+import streamlit as st
+import os
+import tempfile
+from session_4_rag_backend import (
+    setup_api_key,
+    upload_pdf,
+    parse_pdf,
+    create_document_chunks,
+    init_embedding_model,
+    embed_documents,
+    store_embeddings,
+    get_context_from_chunks,
+    query_with_full_context
+)
+
+# Custom CSS for enhanced styling
+st.markdown("""
+<style>
+    /* Main app styling */
+    .stApp {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        color: #ffffff;
+    }
+
+    /* Chat message styling */
+    .stChatMessage {
+        border-radius: 20px;
+        margin: 12px 0;
+        padding: 1.5rem;
+    }
+
+    .user-message {
+        background: rgba(255, 255, 255, 0.1) !important;
+        border: 1px solid rgba(255, 255, 255, 0.2) !important;
+        backdrop-filter: blur(5px);
+    }
+
+    .bot-message {
+        background: rgba(67, 97, 238, 0.15) !important;
+        border: 1px solid #4361ee !important;
+    }
+
+    /* Sidebar styling */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(160deg, #0f3460 0%, #1a1a2e 100%) !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    /* Button styling */
+    .stButton>button {
+        background: linear-gradient(45deg, #4361ee 0%, #3a0ca3 100%);
+        color: white !important;
+        border: none;
+        border-radius: 12px;
+        padding: 10px 24px;
+        transition: all 0.3s;
+    }
+
+    .stButton>button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 15px rgba(67, 97, 238, 0.4);
+    }
+
+    /* File uploader styling */
+    [data-testid="stFileUploader"] {
+        background: rgba(255, 255, 255, 0.05) !important;
+        border: 2px dashed #4361ee !important;
+        border-radius: 20px !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.set_page_config(page_title="🧠 QuantumDoc Analyst", page_icon="🤖", layout="wide")
+
+# Initialize session state
+for key in ["conversation", "vectorstore", "embedding_model", "processed_files"]:
+    if key not in st.session_state:
+        st.session_state[key] = [] if key == "conversation" else None if key != "processed_files" else []
+
+def main():
+    # --- SIDEBAR ---
+    with st.sidebar:
+        st.markdown("<h1 style='border-left: 4px solid #4361ee; padding-left: 12px;'>⚡ Control Center</h1>",
+                   unsafe_allow_html=True)
+
+        with st.expander("🔐 API Gateway", expanded=True):
+            api_key = st.text_input("Gemini API Key:", type="password",
+                                  help="Obtain from Google AI Studio",
+                                  placeholder="sk-xxxxxxxxxxxxxxxx")
+            if api_key and st.button("🚀 Activate"):
+                setup_api_key(api_key)
+                st.success("Authentication Successful!")
+
+        with st.expander("📂 Document Hub", expanded=True):
+            uploaded_files = st.file_uploader("Drag & Drop PDFs",
+                                            type="pdf",
+                                            accept_multiple_files=True,
+                                            help="Max 10 files, 50MB each")
+            if uploaded_files and st.button("⚡ Process Files"):
+                process_documents(uploaded_files)
+
+        if st.session_state.processed_files:
+            st.markdown("### 📚 Active Documents")
+            for file in st.session_state.processed_files:
+                st.markdown(f"""
+                <div style='background: rgba(67, 97, 238, 0.1);
+                          padding: 12px;
+                          border-radius: 10px;
+                          margin: 8px 0;
+                          border-left: 3px solid #4361ee'>
+                    📄 {file}
+                </div>""", unsafe_allow_html=True)
+
+        with st.expander("⚙️ Engine Settings"):
+            st.slider("Context Chunks (k)", 1, 10, 3, key="k_value",
+                     help="Number of document segments to reference")
+            st.slider("Creativity Level", 0.0, 1.0, 0.2, 0.1, key="temperature",
+                     help="Higher = more imaginative, Lower = more factual")
+
+    # --- MAIN INTERFACE ---
+    col1, col2 = st.columns([4, 1], gap="medium")
+
+    with col1:
+        st.markdown("<h1 style='margin-bottom: 30px;'>🧠 QuantumDoc Analyst</h1>",
+                   unsafe_allow_html=True)
+
+        if not st.session_state.vectorstore:
+            # Welcome card design
+            st.markdown("""
+            <div style='background: rgba(255, 255, 255, 0.05);
+                      padding: 40px;
+                      border-radius: 25px;
+                      border: 1px solid rgba(255, 255, 255, 0.1);
+                      backdrop-filter: blur(5px);'>
+                <div style='text-align: center; margin-bottom: 30px;'>
+                    <h3 style='margin-bottom: 20px;'>🚀 Launch Sequence</h3>
+                    <div style='display: grid;
+                              grid-template-columns: repeat(4, 1fr);
+                              gap: 15px;
+                              margin-bottom: 30px;'>
+                        <div style='background: rgba(67, 97, 238, 0.2);
+                                  padding: 15px;
+                                  border-radius: 15px;
+                                  border: 1px solid #4361ee;'>
+                            <div style='font-size: 24px; margin-bottom: 10px;'>1️⃣</div>
+                            <div>Set API Key</div>
+                        </div>
+                        <!-- Add similar divs for steps 2-4 -->
+                    </div>
+                    <div style='background: rgba(255, 255, 255, 0.05);
+                              padding: 25px;
+                              border-radius: 15px;
+                              border: 1px solid rgba(255, 255, 255, 0.1);'>
+                        <h4 style='margin-bottom: 15px;'>💡 Smart Prompts</h4>
+                        <div style='color: #a0a3bd; font-size: 14px;'>
+                            "Summarize the key findings from the documents"<br>
+                            "Compare and contrast the main arguments"
+                        </div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            display_chat()
+            user_query = st.chat_input("🔍 Ask anything about your knowledge base...")
+            if user_query:
+                handle_user_query(user_query)
+
+    with col2:
+        st.markdown("<h3 style='margin-bottom: 20px;'>📊 Session Dashboard</h3>",
+                   unsafe_allow_html=True)
+
+        if st.button("🔄 New Session", use_container_width=True,
+                   help="Start fresh conversation"):
+            reset_conversation()
+            st.success("Session Reset!")
+
+        st.markdown("""
+        <div style='background: rgba(255, 255, 255, 0.05);
+                  padding: 20px;
+                  border-radius: 15px;
+                  border: 1px solid rgba(255, 255, 255, 0.1);'>
+            <div style='color: #a0a3bd; margin-bottom: 15px;'>📌 Session Stats</div>
+            <div style='display: flex; justify-content: space-between; margin-bottom: 12px;'>
+                <div>📑 Documents</div>
+                <div style='color: #4361ee;'>{}</div>
+            </div>
+            <div style='display: flex; justify-content: space-between;'>
+                <div>💬 Messages</div>
+                <div style='color: #4361ee;'>{}</div>
+            </div>
+        </div>
+        """.format(
+            len(st.session_state.processed_files),
+            len(st.session_state.conversation)
+        ), unsafe_allow_html=True)
+
+    # Footer
+    st.markdown("""
+    <div style='position: fixed;
+              bottom: 0;
+              left: 0;
+              right: 0;
+              background: rgba(16, 24, 39, 0.9);
+              padding: 15px;
+              text-align: center;
+              border-top: 1px solid rgba(255, 255, 255, 0.1);'>
+        <div style='color: #a0a3bd; font-size: 14px;'>
+            Powered by 🌌 Gemini AI | 🚀 Streamlit | v2.1.0
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Rest of your backend functions (process_documents, handle_user_query, display_chat, etc.)
+# ... [Keep all your existing backend functions unchanged] ...
+
+if _name_ == "_main_":
+    main()
+
+!streamlit run rag_streamlit.py --server.port=8989 &>./logs.txt &
